@@ -1,28 +1,68 @@
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+import { GoogleGenAI } from "npm:@google/genai@1.0.0";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
 };
 
-const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
-const GEMINI_MODEL = "gemini-1.5-flash";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  contents: string,
+  primaryModel = "gemini-flash-latest",
+  fallbackModel = "gemini-flash-lite-latest",
+  retries = 3
+) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await ai.models.generateContent({
+        model: primaryModel,
+        contents,
+      });
+    } catch (e) {
+      const msg = String(e);
+      const isOverloaded = msg.includes("503") || msg.includes("UNAVAILABLE");
 
-Deno.serve(async (req: Request) => {
+      if (isOverloaded && i < retries - 1) {
+        console.warn(`Model overloaded, retrying in ${i + 1}s... (attempt ${i + 1})`);
+        await new Promise((res) => setTimeout(res, 1000 * (i + 1)));
+        continue;
+      }
+
+      if (isOverloaded) {
+        console.warn(`Primary model overloaded, trying fallback: ${fallbackModel}`);
+        try {
+          return await ai.models.generateContent({
+            model: fallbackModel,
+            contents,
+          });
+        } catch (fallbackError) {
+          throw fallbackError;
+        }
+      }
+      throw e;
+    }
+  }
+  throw new Error("Failed to generate content after retries");
+}
+
+Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
+    return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(JSON.stringify({ error: "Missing auth" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+    if (!GEMINI_API_KEY) {
+      throw new Error(
+        "GEMINI_API_KEY is not set. Run: supabase secrets set GEMINI_API_KEY=your_key"
+      );
     }
+
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) throw new Error("Unauthorized");
 
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
@@ -31,129 +71,69 @@ Deno.serve(async (req: Request) => {
     );
 
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+    if (!user) throw new Error("Unauthorized");
+
+    const { pdfId, question, pdfContent } = await req.json();
+
+    if (!question) {
+      throw new Error("Missing question in request body");
     }
 
-    const { pdfId, question } = await req.json();
+    let context = pdfContent || "";
+    if (!context && pdfId) {
+      const { data: pdf } = await supabase
+        .from("pdfs")
+        .select("content")
+        .eq("id", pdfId)
+        .single();
+      if (pdf?.content) context = pdf.content;
+    }
 
-const { data: pdf, error: pdfError } = await supabase
-  .from("pdfs")
-  .select("content")
-  .eq("id", pdfId)
-  .single();
+    context = context.substring(0, 30000);
 
-if (pdfError || !pdf) {
-  throw new Error("Unable to load PDF content.");
-}
+    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-const context = (pdf.content || "").slice(0, 30000);
+    const prompt = `
+You are StudySphere AI, a world-class AI tutor helping a student learn for university exams.
 
-    const systemPrompt = `
-You are StudySphere AI, an expert AI tutor.
+CRITICAL FORMATTING INSTRUCTIONS:
+- NEVER return giant wall of plain paragraphs.
+- ALWAYS use proper Markdown headings (##, ###).
+- Use bullet points (- ) and numbered lists for steps or points.
+- Use **bold** for key terms and concepts.
+- Use markdown tables (| Col 1 | Col 2 |) when comparing items or organizing structured data.
+- Include practical examples or code snippets where applicable.
+- Make the answer look like professionally formatted university study notes.
 
-The text below comes from the student's uploaded PDF.
-
-Your job is NOT to copy the PDF.
-
-Instead:
-
-• Read the PDF carefully.
-• Answer ONLY the user's question.
-• Explain in simple language.
-• Use headings.
-• Use bullet points.
-• Give examples whenever possible.
-• Do NOT repeat the entire document.
-• Do NOT start your answer by quoting the PDF.
-• If the PDF contains the answer, explain it naturally.
-• If the PDF does not contain enough information, clearly say so and then use your own knowledge to help the student.
-
----------------------------------
-
-DOCUMENT
-
+STUDY MATERIAL CONTEXT:
 ${context}
 
----------------------------------
-
-QUESTION
-
+STUDENT QUESTION:
 ${question}
-
-Return only the answer.
 `;
 
-    let answer = "";
-    let sources: { page: number; text: string }[] = [];
-    let confidence = 0.7;
+    const result = await generateWithRetry(ai, prompt);
+    const answer = result.text;
 
-    if (GEMINI_API_KEY) {
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: systemPrompt,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 4096,
-          },
-        }),
-      });
-    
-      if (!geminiRes.ok) {
-        const errorText = await geminiRes.text();
-        throw new Error(`Gemini Error ${geminiRes.status}: ${errorText}`);
-      }
-    
-      const geminiData = await geminiRes.json();
-    
-      answer =
-        geminiData.candidates?.[0]?.content?.parts?.[0]?.text ??
-        "No response returned from Gemini.";
-    
-      confidence = context ? 0.95 : 0.6;
-    
-      if (context) {
-        const relevant = context
-          .split(/[.!?]+/)
-          .filter((s) => s.trim().length > 20)
-          .slice(0, 3);
-    
-        sources = relevant.map((s, i) => ({
-          page: i + 1,
-          text: s.trim(),
-        }));
-      }
-    } else {
-      answer = generateFallbackAnswer();
-    }
-
-    const sourceType = sources.length > 0 ? "document" : "general";
-
-    return new Response(JSON.stringify({ answer, sources, confidence, sourceType }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
-  } catch (error) {
-    console.error(error);
-  
     return new Response(
       JSON.stringify({
-        error: error instanceof Error ? error.message : String(error),
+        answer,
+        confidence: 0.95,
+        sourceType: context ? "document" : "general",
+        sources: [],
+      }),
+      {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+  } catch (e) {
+    console.error("AI chat edge function error:", e);
+    return new Response(
+      JSON.stringify({
+        error: String(e instanceof Error ? e.message : e),
       }),
       {
         status: 500,
@@ -165,7 +145,3 @@ Return only the answer.
     );
   }
 });
-
-function generateFallbackAnswer() {
-  return "THIS IS THE FALLBACK";
-}

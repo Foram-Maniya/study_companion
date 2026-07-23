@@ -7,8 +7,61 @@ const corsHeaders = {
 };
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
-const GEMINI_MODEL = "gemini-1.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+// Strip ```json ... ``` fences some models add even when
+// responseMimeType is set to application/json.
+function cleanJsonText(text: string): string {
+  return text
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/, "")
+    .replace(/```\s*$/, "")
+    .trim();
+}
+
+const extractionSchema = {
+  type: "OBJECT",
+  properties: {
+    text: { type: "STRING" },
+    pageCount: { type: "NUMBER" },
+    topics: { type: "ARRAY", items: { type: "STRING" } },
+  },
+  required: ["text", "pageCount", "topics"],
+};
+
+const topicsSchema = {
+  type: "ARRAY",
+  items: { type: "STRING" },
+};
+
+// Retries only on 503 (server overloaded) — other errors like 429 quota
+// exhaustion or 404 model-not-found won't be fixed by retrying.
+async function fetchGeminiWithRetry(
+  url: string,
+  body: unknown,
+  retries = 3
+): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res;
+
+    if (res.status === 503 && i < retries - 1) {
+      console.warn(`Gemini overloaded (503), retrying in ${i + 1}s... (attempt ${i + 1})`);
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      continue;
+    }
+
+    return res;
+  }
+  throw new Error("Unreachable");
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -52,122 +105,122 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    const pdfBytes = Uint8Array.from(atob(fileContent), (c) =>
-      c.charCodeAt(0)
-    );
-    
+    const pdfBytes = Uint8Array.from(atob(fileContent), (c) => c.charCodeAt(0));
+
     let extractedText = frontendText || "";
     let pageCount = frontendPageCount || 1;
-    let topics: string[] = [];;
+    let topics: string[] = [];
+    let debugNotes: string[] = [];
 
-    if (GEMINI_API_KEY && extractedText.length < 100)  {
-      // Send PDF directly to Gemini for text extraction and topic detection
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: "application/pdf",
-                    data: fileContent, // base64 encoded
-                  },
+    if (GEMINI_API_KEY && extractedText.length < 100) {
+      const geminiRes = await fetchGeminiWithRetry(GEMINI_URL, {
+        contents: [
+          {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: "application/pdf",
+                  data: fileContent,
                 },
-                {
-                  text: `Analyze this PDF document. Extract ALL the text content from every page. Then identify the main topics covered.
+              },
+              {
+                text: `Analyze this PDF document. Extract ALL the text content from every page. Then identify the main topics covered.
 
-Format your response as JSON:
-{
-  "text": "All extracted text from the document, preserving structure and paragraphs",
-  "pageCount": <estimated number of pages>,
-  "topics": ["topic1", "topic2", ...]
-}
-
-Extract as much text as possible. If the PDF is scanned images, describe what you see.`,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 8192,
-            responseMimeType: "application/json",
+Extract as much text as possible. If the PDF is scanned images, describe what you see.
+Estimate the page count as a number.`,
+              },
+            ],
           },
-        }),
+        ],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 8192,
+          responseMimeType: "application/json",
+          responseSchema: extractionSchema,
+        },
       });
 
       if (geminiRes.ok) {
         const data = await geminiRes.json();
         const responseText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
         try {
-          const parsed = JSON.parse(responseText);
+          const parsed = JSON.parse(cleanJsonText(responseText));
           extractedText = parsed.text || "";
           pageCount = parsed.pageCount || Math.max(1, Math.round(pdfBytes.length / 50000));
           topics = parsed.topics || [];
-        } catch {
-          // If JSON parse fails, use raw text
+        } catch (parseErr) {
+          console.error("PDF extraction JSON parse failed. Raw text was:", responseText);
+          console.error("Parse error:", parseErr);
+          debugNotes.push(`Extraction JSON parse failed: ${String(parseErr)}`);
           extractedText = responseText;
           pageCount = Math.max(1, Math.round(pdfBytes.length / 50000));
         }
+      } else {
+        const errBody = await geminiRes.text();
+        console.error(`Gemini PDF extraction error ${geminiRes.status}:`, errBody);
+        debugNotes.push(`Gemini extraction returned ${geminiRes.status}: ${errBody}`);
       }
     }
 
-    // Fallback: if Gemini didn't produce text, use a basic estimate
     if (!extractedText || extractedText.trim().length === 0) {
       extractedText = "No text could be extracted from this PDF.";
     }
-    
+
     if (pageCount <= 0) {
       pageCount = 1;
     }
-    
+
     if (topics.length === 0) {
       topics = ["General Topics"];
     }
 
-    if (GEMINI_API_KEY && extractedText.length > 100 && topics.length === 0) {
+    if (GEMINI_API_KEY && extractedText.length > 100 && topics[0] === "General Topics") {
       try {
-        const topicRes = await fetch(GEMINI_URL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
+        const topicRes = await fetchGeminiWithRetry(GEMINI_URL, {
+          contents: [
+            {
+              parts: [
+                {
+                  text:
+                    `Identify 3-6 main study topics from the following text. Return only short topic names.\n\n` +
+                    extractedText.slice(0, 20000),
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 1024,
+            responseMimeType: "application/json",
+            responseSchema: topicsSchema,
           },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text:
-                      `Identify the main study topics from the following text. Return ONLY a JSON array.\n\n` +
-                      extractedText.slice(0, 20000),
-                  },
-                ],
-              },
-            ],
-          }),
         });
-    
+
         if (topicRes.ok) {
           const json = await topicRes.json();
-          const response =
-            json.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    
+          const response = json.candidates?.[0]?.content?.parts?.[0]?.text || "";
           try {
-            topics = JSON.parse(response);
-          } catch {
-            topics = ["Study Material"];
+            const parsedTopics = JSON.parse(cleanJsonText(response));
+            if (Array.isArray(parsedTopics) && parsedTopics.length > 0) {
+              topics = parsedTopics;
+            }
+          } catch (parseErr) {
+            console.error("Topic JSON parse failed. Raw text was:", response);
+            debugNotes.push(`Topic JSON parse failed: ${String(parseErr)}`);
           }
+        } else {
+          const errBody = await topicRes.text();
+          console.error(`Gemini topic extraction error ${topicRes.status}:`, errBody);
+          debugNotes.push(`Gemini topic call returned ${topicRes.status}: ${errBody}`);
         }
-      } catch (_) {
-        topics = ["Study Material"];
+      } catch (e) {
+        console.error("Topic extraction threw:", e);
+        debugNotes.push(`Topic extraction threw: ${String(e)}`);
       }
     }
 
-    // Update the PDF record with extracted content
     if (pdfId) {
-      await supabase
+      const { error: updateError } = await supabase
         .from("pdfs")
         .update({
           content: extractedText,
@@ -176,6 +229,11 @@ Extract as much text as possible. If the PDF is scanned images, describe what yo
           status: "ready",
         })
         .eq("id", pdfId);
+
+      if (updateError) {
+        console.error("Failed to update pdfs row:", updateError);
+        debugNotes.push(`DB update failed: ${updateError.message}`);
+      }
     }
 
     return new Response(
@@ -183,13 +241,15 @@ Extract as much text as possible. If the PDF is scanned images, describe what yo
         text: extractedText,
         pageCount,
         topics: topics.length > 0 ? topics : ["General Topics"],
+        _debug: debugNotes.length > 0 ? debugNotes : undefined,
       }),
       { headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   } catch (err) {
-    return new Response(
-      JSON.stringify({ error: err.message }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    console.error("process-pdf function error:", err);
+    return new Response(JSON.stringify({ error: err.message }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
   }
 });

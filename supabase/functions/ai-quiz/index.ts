@@ -7,8 +7,47 @@ const corsHeaders = {
 };
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
-const GEMINI_MODEL = "gemini-1.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+// Strip ```json ... ``` or ``` ... ``` fences some models add even when
+// responseMimeType is set to application/json.
+function cleanJsonText(text: string): string {
+  return text
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/, "")
+    .replace(/```\s*$/, "")
+    .trim();
+}
+
+// Retries only on 503 (server overloaded) — other errors like 429 quota
+// exhaustion or 404 model-not-found won't be fixed by retrying, so we
+// return those immediately for the caller to handle.
+async function fetchGeminiWithRetry(
+  url: string,
+  body: unknown,
+  retries = 3
+): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res;
+
+    if (res.status === 503 && i < retries - 1) {
+      console.warn(`Gemini overloaded (503), retrying in ${i + 1}s... (attempt ${i + 1})`);
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      continue;
+    }
+
+    return res;
+  }
+  throw new Error("Unreachable");
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -49,54 +88,99 @@ Deno.serve(async (req: Request) => {
 
     const prompt = `Based on the following study material, ${typeInstructions[type] || typeInstructions.mcq}
 
-Format your response as JSON:
-{
-  "questions": [
-    {
-      "type": "${type}",
-      "question": "...",
-      "options": ["A", "B", "C", "D"],
-      "answer": "correct option",
-      "explanation": "why this is correct"
-    }
-  ]
-}
+Keep each question and explanation concise (1-2 sentences). Do not copy long
+raw passages from the study material verbatim — write original questions
+that test understanding of the concepts instead.
 
 Study material:
 ${context}`;
 
+    // Forces Gemini to return data matching this exact shape, which avoids
+    // the malformed/truncated JSON issues you get from free-form "please
+    // output JSON" prompting.
+    const responseSchema = {
+      type: "OBJECT",
+      properties: {
+        questions: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              type: { type: "STRING" },
+              question: { type: "STRING" },
+              options: { type: "ARRAY", items: { type: "STRING" } },
+              answer: { type: "STRING" },
+              explanation: { type: "STRING" },
+            },
+            required: ["type", "question", "answer", "explanation"],
+          },
+        },
+      },
+      required: ["questions"],
+    };
+
     let questions: any[] = [];
+    let usedFallback = false;
+    let fallbackReason = "";
 
     if (GEMINI_API_KEY) {
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.7, maxOutputTokens: 2048, responseMimeType: "application/json" },
-        }),
+      const geminiRes = await fetchGeminiWithRetry(GEMINI_URL, {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 4096,
+          responseMimeType: "application/json",
+          responseSchema,
+        },
       });
 
       if (geminiRes.ok) {
         const data = await geminiRes.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
         try {
-          const parsed = JSON.parse(text);
+          const parsed = JSON.parse(cleanJsonText(rawText));
           questions = parsed.questions || [];
-        } catch {
-          questions = generateFallbackQuiz(context, type);
+          if (questions.length === 0) {
+            usedFallback = true;
+            fallbackReason = "Gemini returned an empty questions array";
+          }
+        } catch (parseErr) {
+          console.error("Quiz JSON parse failed. Raw text was:", rawText);
+          console.error("Parse error:", parseErr);
+          usedFallback = true;
+          fallbackReason = `JSON parse failed: ${String(parseErr)}`;
         }
       } else {
-        questions = generateFallbackQuiz(context, type);
+        const errBody = await geminiRes.text();
+        console.error(`Gemini API error ${geminiRes.status}:`, errBody);
+        usedFallback = true;
+        fallbackReason = `Gemini API returned ${geminiRes.status}: ${errBody}`;
       }
     } else {
+      usedFallback = true;
+      fallbackReason = "GEMINI_API_KEY is not set";
+    }
+
+    if (usedFallback) {
+      console.error("Falling back to dummy quiz generator. Reason:", fallbackReason);
       questions = generateFallbackQuiz(context, type);
     }
 
-    return new Response(JSON.stringify({ questions }), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        questions,
+        // Remove this field once you've confirmed things are working —
+        // it's here temporarily so you can see fallback reasons in the
+        // Network tab response without digging through logs.
+        _debug: usedFallback ? { usedFallback, fallbackReason } : undefined,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
   } catch (err) {
+    console.error("Quiz function error:", err);
     return new Response(JSON.stringify({ error: err.message }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },

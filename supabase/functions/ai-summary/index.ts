@@ -7,8 +7,46 @@ const corsHeaders = {
 };
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
-const GEMINI_MODEL = "gemini-1.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+// Strip ```json ... ``` fences some models add even when
+// responseMimeType is set to application/json.
+function cleanJsonText(text: string): string {
+  return text
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/, "")
+    .replace(/```\s*$/, "")
+    .trim();
+}
+
+// Retries only on 503 (server overloaded) — other errors like 429 quota
+// exhaustion or 404 model-not-found won't be fixed by retrying.
+async function fetchGeminiWithRetry(
+  url: string,
+  body: unknown,
+  retries = 3
+): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res;
+
+    if (res.status === 503 && i < retries - 1) {
+      console.warn(`Gemini overloaded (503), retrying in ${i + 1}s... (attempt ${i + 1})`);
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      continue;
+    }
+
+    return res;
+  }
+  throw new Error("Unreachable");
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -43,46 +81,73 @@ Deno.serve(async (req: Request) => {
 
     const prompt = `Create a comprehensive chapter summary from the following study material.
 
-Format your response as JSON:
-{
-  "summary": "A clear, well-structured summary paragraph",
-  "keyPoints": ["key point 1", "key point 2", ...]
-}
+Write in your own words — do not copy long raw passages verbatim.
 
 Study material:
 ${context}`;
 
+    // Forces Gemini to return data matching this exact shape, avoiding
+    // malformed/truncated JSON from free-form "please output JSON" prompting.
+    const responseSchema = {
+      type: "OBJECT",
+      properties: {
+        summary: { type: "STRING" },
+        keyPoints: { type: "ARRAY", items: { type: "STRING" } },
+      },
+      required: ["summary", "keyPoints"],
+    };
+
     let result = { summary: "", keyPoints: [] as string[] };
+    let usedFallback = false;
+    let fallbackReason = "";
 
     if (GEMINI_API_KEY) {
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.5, maxOutputTokens: 2048, responseMimeType: "application/json" },
-        }),
+      const geminiRes = await fetchGeminiWithRetry(GEMINI_URL, {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.5,
+          maxOutputTokens: 4096,
+          responseMimeType: "application/json",
+          responseSchema,
+        },
       });
 
       if (geminiRes.ok) {
         const data = await geminiRes.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
         try {
-          result = JSON.parse(text);
-        } catch {
+          result = JSON.parse(cleanJsonText(rawText));
+        } catch (parseErr) {
+          console.error("Summary JSON parse failed. Raw text was:", rawText);
+          console.error("Parse error:", parseErr);
+          usedFallback = true;
+          fallbackReason = `JSON parse failed: ${String(parseErr)}`;
           result = generateFallbackSummary(context);
         }
       } else {
+        const errBody = await geminiRes.text();
+        console.error(`Gemini API error ${geminiRes.status}:`, errBody);
+        usedFallback = true;
+        fallbackReason = `Gemini API returned ${geminiRes.status}: ${errBody}`;
         result = generateFallbackSummary(context);
       }
     } else {
+      usedFallback = true;
+      fallbackReason = "GEMINI_API_KEY is not set";
       result = generateFallbackSummary(context);
     }
 
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        ...result,
+        _debug: usedFallback ? { usedFallback, fallbackReason } : undefined,
+      }),
+      {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      }
+    );
   } catch (err) {
+    console.error("Summary function error:", err);
     return new Response(JSON.stringify({ error: err.message }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },

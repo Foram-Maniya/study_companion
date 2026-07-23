@@ -7,8 +7,42 @@ const corsHeaders = {
 };
 
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY") || "";
-const GEMINI_MODEL = "gemini-1.5-flash";
+const GEMINI_MODEL = "gemini-flash-latest";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+function cleanJsonText(text: string): string {
+  return text
+    .trim()
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/, "")
+    .replace(/```\s*$/, "")
+    .trim();
+}
+
+async function fetchGeminiWithRetry(
+  url: string,
+  body: unknown,
+  retries = 3
+): Promise<Response> {
+  for (let i = 0; i < retries; i++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res;
+
+    if (res.status === 503 && i < retries - 1) {
+      console.warn(`Gemini overloaded (503), retrying in ${i + 1}s...`);
+      await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+      continue;
+    }
+
+    return res;
+  }
+  throw new Error("Unreachable");
+}
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -39,38 +73,91 @@ Deno.serve(async (req: Request) => {
     }
 
     const { pdfId, pdfContent } = await req.json();
-    const context = pdfContent ? pdfContent.slice(0, 8000) : "";
+    const context = pdfContent ? pdfContent.slice(0, 12000) : "";
 
-    const prompt = `Create last-minute revision notes from the following study material. Focus on the most important concepts, formulas, and key points that a student should review before an exam.
+    const prompt = `Generate a 5-minute Quick Revision Sheet for university exam preparation from the following study material.
 
-Format your response as JSON:
-{
-  "notes": "Concise revision notes",
-  "keyFormulas": ["formula 1", "formula 2", ...],
-  "importantDates": ["important point 1", ...]
-}
+Include:
+1. Chapter/Main Subject Name
+2. Key Definitions (term + definition)
+3. Key Formulas & Equations
+4. Flowchart / Mind Map in Mermaid syntax (e.g. graph TD\\n A[Start] --> B[Process])
+5. Comparison Table (headers + rows comparing key concepts)
+6. Pro Exam Tips
+7. Frequently Asked Questions (Q&A)
+8. Expected Viva Questions
+9. Memory Tricks & Mnemonics
 
 Study material:
 ${context}`;
 
-    let result = { notes: "", keyFormulas: [] as string[], importantDates: [] as string[] };
+    const responseSchema = {
+      type: "OBJECT",
+      properties: {
+        chapterName: { type: "STRING" },
+        definitions: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              term: { type: "STRING" },
+              definition: { type: "STRING" },
+            },
+          },
+        },
+        keyFormulas: { type: "ARRAY", items: { type: "STRING" } },
+        flowchart: { type: "STRING" },
+        comparisonTable: {
+          type: "OBJECT",
+          properties: {
+            headers: { type: "ARRAY", items: { type: "STRING" } },
+            rows: {
+              type: "ARRAY",
+              items: {
+                type: "ARRAY",
+                items: { type: "STRING" },
+              },
+            },
+          },
+        },
+        examTips: { type: "ARRAY", items: { type: "STRING" } },
+        faqs: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              q: { type: "STRING" },
+              a: { type: "STRING" },
+            },
+          },
+        },
+        vivaQuestions: { type: "ARRAY", items: { type: "STRING" } },
+        memoryTricks: { type: "ARRAY", items: { type: "STRING" } },
+        keywords: { type: "ARRAY", items: { type: "STRING" } },
+      },
+      required: ["chapterName", "definitions", "keyFormulas", "examTips"],
+    };
+
+    let result = {};
 
     if (GEMINI_API_KEY) {
-      const geminiRes = await fetch(GEMINI_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.5, maxOutputTokens: 2048, responseMimeType: "application/json" },
-        }),
+      const geminiRes = await fetchGeminiWithRetry(GEMINI_URL, {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.4,
+          maxOutputTokens: 4096,
+          responseMimeType: "application/json",
+          responseSchema,
+        },
       });
 
       if (geminiRes.ok) {
         const data = await geminiRes.json();
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
         try {
-          result = JSON.parse(text);
-        } catch {
+          result = JSON.parse(cleanJsonText(rawText));
+        } catch (parseErr) {
+          console.error("Revision parse error:", parseErr);
           result = generateFallbackRevision(context);
         }
       } else {
@@ -84,7 +171,8 @@ ${context}`;
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
+    console.error("Revision function error:", err);
+    return new Response(JSON.stringify({ error: String(err) }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
@@ -92,10 +180,12 @@ ${context}`;
 });
 
 function generateFallbackRevision(context: string) {
-  const sentences = context.split(/[.!?]+/).filter((s) => s.trim().length > 15);
   return {
-    notes: sentences.slice(0, 8).join(". "),
-    keyFormulas: ["Review key formulas from your material"],
-    importantDates: ["Review important points from your material"],
+    chapterName: "Revision Summary",
+    definitions: [{ term: "Key Topic", definition: "Primary concept from study material" }],
+    keyFormulas: ["Review formulas from material"],
+    flowchart: "graph TD\n  A[Study Material] --> B[Key Concepts]\n  B --> C[Exam Prep]",
+    examTips: ["Focus on high-frequency questions", "Practice drawing clear diagrams"],
+    vivaQuestions: ["What is the main algorithm described?", "What are its limitations?"],
   };
 }

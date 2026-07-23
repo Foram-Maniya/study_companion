@@ -30,14 +30,25 @@ interface SummaryResponse {
 }
 
 interface RevisionResponse {
-  notes: string;
-  keyFormulas: string[];
-  importantDates: string[];
+  chapterName?: string;
+  definitions?: { term: string; definition: string }[];
+  keyFormulas?: string[];
+  flowchart?: string;
+  comparisonTable?: { headers: string[]; rows: string[][] };
+  examTips?: string[];
+  faqs?: { q: string; a: string }[];
+  memoryTricks?: string[];
+  keywords?: string[];
+  expectedQuestions?: string[];
+  vivaQuestions?: string[];
+  pyqConnections?: { year: string; question: string; marks: number }[];
+  notes?: string;
+  importantDates?: string[];
 }
 
 interface PyqResponse {
-  questions: string[];
-  frequency: { topic: string; count: number }[];
+  questions: any[];
+  frequency: { topic: string; count: number; avgMarks?: number; priority?: string }[];
   trends: { year: string; topics: string[] }[];
   importantChapters: string[];
   duplicates: { question: string; count: number }[];
@@ -62,8 +73,9 @@ async function callEdgeFunction(name: string, body: Record<string, unknown>) {
   });
 
   if (!response.ok) {
-    const errorBody = await response.json().catch(() => ({ error: "Request failed" }));
-    throw new Error(errorBody.error || `Request failed (${response.status})`);
+    const text = await response.text();
+    console.error(`EDGE FUNCTION [${name}] ERROR:`, text);
+    throw new Error(text);
   }
 
   const data = await response.json();
@@ -83,8 +95,9 @@ export const aiService = {
   ): Promise<ChatResponse> {
     const res = await callEdgeFunction("ai-chat", {
       pdfId,
-      question
-  });
+      question,
+      pdfContent,
+    });
     return {
       answer: res.answer,
       sources: res.sources || [],
@@ -106,10 +119,39 @@ export const aiService = {
   async generateRevision(pdfId: string, pdfContent: string): Promise<RevisionResponse> {
     const res = await callEdgeFunction("ai-revision", { pdfId, pdfContent });
     return {
-      notes: res.notes || "",
+      chapterName: res.chapterName,
+      definitions: res.definitions || [],
       keyFormulas: res.keyFormulas || [],
+      flowchart: res.flowchart || "",
+      comparisonTable: res.comparisonTable,
+      examTips: res.examTips || [],
+      faqs: res.faqs || [],
+      memoryTricks: res.memoryTricks || [],
+      keywords: res.keywords || [],
+      expectedQuestions: res.expectedQuestions || [],
+      vivaQuestions: res.vivaQuestions || [],
+      pyqConnections: res.pyqConnections || [],
+      notes: res.notes || "",
       importantDates: res.importantDates || [],
     };
+  },
+
+  async generateFlashcards(pdfId: string, pdfContent: string) {
+    const res = await callEdgeFunction("ai-quiz", { pdfId, type: "flashcards", pdfContent });
+    return res.cards || res.questions || [];
+  },
+
+  async generateEssayQuestions(pdfId: string, markType: "short" | "long", pdfContent: string) {
+    const res = await callEdgeFunction("ai-quiz", { pdfId, type: markType, pdfContent });
+    return res.questions || [];
+  },
+
+  async evaluateVivaAnswer(question: string, answer: string, pdfContent: string) {
+    const res = await callEdgeFunction("ai-chat", {
+      question: `Evaluate my viva answer for: "${question}". My answer was: "${answer}". Give score out of 10 and constructive feedback.`,
+      pdfContent,
+    });
+    return res.answer;
   },
 
   async analyzePyq(
@@ -127,8 +169,8 @@ export const aiService = {
     };
   },
 
-  async generateAnswer(question: string, pdfContent: string): Promise<string> {
-    const res = await callEdgeFunction("ai-answer", { question, pdfContent });
+  async generateAnswer(question: string, pdfContent: string, marks?: number): Promise<string> {
+    const res = await callEdgeFunction("ai-answer", { question, pdfContent, marks });
     return res.answer;
   },
 };
